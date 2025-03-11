@@ -1,0 +1,8 @@
+.env
+.vscode
+dumbs
+old
+token.json
+last_email.json
+credentials.json
+email_records.json
