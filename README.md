@@ -9,6 +9,7 @@ This application automatically monitors a Gmail inbox for journal submission sta
 - 🔄 Match emails to existing journal submissions in Supabase database
 - ✅ Automatically update submission status in database
 - 🔒 Securely handle sensitive information with encryption
+- 🔑 Automatic API key rotation when quota is exceeded
 
 ## 🚀 Setup Guide
 
@@ -18,7 +19,7 @@ This application automatically monitors a Gmail inbox for journal submission sta
 - Python 3.8+ 
 - Gmail account with API access enabled
 - Supabase account and project
-- Google Gemini API key
+- Google Gemini API key(s)
 
 ### Step 1: Clone the Repository
 

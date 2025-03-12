@@ -16,9 +16,113 @@ from fuzzywuzzy import fuzz  # For fuzzy matching
 # Load environment variables
 load_dotenv()
 
+# API key management
+class APIKeyManager:
+    def __init__(self):
+        # Get API keys from environment variables
+        self.api_keys = self._load_api_keys()
+        self.current_key_index = 0
+        self.config_file = "api_key_config.json"
+        self._load_config()
+        
+        # Configure initial API key
+        self._configure_current_key()
+        
+    def _load_api_keys(self):
+        """Load API keys from environment variables."""
+        keys = []
+        i = 1
+        # Try to get GEMINI_API_KEY (primary)
+        primary_key = os.getenv("GEMINI_API_KEY")
+        if primary_key:
+            keys.append(primary_key)
+            
+        # Try to get GEMINI_API_KEY_1, GEMINI_API_KEY_2, etc.
+        while True:
+            key = os.getenv(f"GEMINI_API_KEY_{i}")
+            if key:
+                keys.append(key)
+                i += 1
+            else:
+                break
+                
+        if not keys:
+            raise ValueError("No Gemini API keys found in environment variables")
+            
+        print(f"🔑 Loaded {len(keys)} Gemini API key(s)")
+        return keys
+        
+    def _load_config(self):
+        """Load the last used API key index from config file."""
+        if os.path.exists(self.config_file):
+            try:
+                with open(self.config_file, 'r') as f:
+                    config = json.load(f)
+                    self.current_key_index = config.get('current_key_index', 0)
+                    
+                    # Make sure the index is valid (in case fewer keys are available now)
+                    if self.current_key_index >= len(self.api_keys):
+                        self.current_key_index = 0
+                        
+                    print(f"📄 Loaded API key configuration, using key #{self.current_key_index+1}")
+            except Exception as e:
+                print(f"⚠️ Error loading API key configuration: {e}")
+                self.current_key_index = 0
+    
+    def _save_config(self):
+        """Save the current key index to the config file."""
+        config = {'current_key_index': self.current_key_index}
+        with open(self.config_file, 'w') as f:
+            json.dump(config, f)
+            
+    def _configure_current_key(self):
+        """Configure Gemini with the current API key."""
+        if 0 <= self.current_key_index < len(self.api_keys):
+            genai.configure(api_key=self.api_keys[self.current_key_index])
+            print(f"🔄 Using Gemini API key #{self.current_key_index+1}")
+            return True
+        return False
+    
+    def get_current_key(self):
+        """Return the currently active API key."""
+        return self.api_keys[self.current_key_index]
+        
+    def rotate_key(self):
+        """Switch to the next available API key."""
+        previous_key = self.current_key_index
+        self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
+        
+        if self._configure_current_key():
+            self._save_config()
+            print(f"🔄 Rotated from API key #{previous_key+1} to #{self.current_key_index+1}")
+            return True
+        return False
+        
+    def handle_api_error(self, error):
+        """Check if error is quota-related and rotate key if needed."""
+        error_str = str(error).lower()
+        
+        # Check for different quota/rate limit error messages
+        quota_exceeded = any(msg in error_str for msg in [
+            "quota exceeded", 
+            "resource exhausted",
+            "rate limit",
+            "too many requests",
+            "billing"
+        ])
+        
+        if quota_exceeded:
+            print(f"⚠️ API quota exceeded for key #{self.current_key_index+1}. Rotating to next key.")
+            return self.rotate_key()
+        else:
+            print(f"❌ API error not related to quota: {error}")
+            return False
+
+# Initialize the API key manager
+api_key_manager = APIKeyManager()
+
 # Get sensitive data from environment variables
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-genai.configure(api_key=GEMINI_API_KEY)
+GEMINI_API_KEY = api_key_manager.get_current_key()  # Initial key setup
 
 # Supabase credentials from environment variables
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -298,7 +402,7 @@ def extract_journal_details(email_body):
     The email MUST be a personalized notification about a manuscript submission process (e.g., 'Your manuscript has been accepted'), 
     and the status MUST reflect an outcome or update in that process (e.g., 'accepted', 'rejected', 'under review', 'revise and resubmit', etc.). 
     Exclude emails that are table of contents alerts, newsletters, or general journal updates (e.g., 'new issue available', 'full text PDF' are NOT valid statuses). 
-    If the email isn’t about a specific manuscript submission status, return 'Unknown Status'.
+    If the email isn't about a specific manuscript submission status, return 'Unknown Status'.
 
     Email:
     {email_body}
@@ -313,27 +417,45 @@ def extract_journal_details(email_body):
     If the email is not about a manuscript submission status, return 'Unknown Status'.
     """
 
-    try:
-        model = genai.GenerativeModel("gemini-2.0-flash-lite")
-        response = model.generate_content(prompt)
-        extracted_text = response.text.strip()
+    max_retries = len(api_key_manager.api_keys)
+    retries = 0
+    
+    while retries <= max_retries:
+        try:
+            model = genai.GenerativeModel("gemini-2.0-flash-lite")
+            response = model.generate_content(prompt)
+            extracted_text = response.text.strip()
 
-        journal_match = re.search(r'Journal:\s*(.+)', extracted_text)
-        manuscript_match = re.search(r'Manuscript:\s*(.+)', extracted_text)
-        status_match = re.search(r'Status:\s*(.+)', extracted_text)
+            journal_match = re.search(r'Journal:\s*(.+)', extracted_text)
+            manuscript_match = re.search(r'Manuscript:\s*(.+)', extracted_text)
+            status_match = re.search(r'Status:\s*(.+)', extracted_text)
 
-        journal_name = journal_match.group(1) if journal_match else "Unknown Journal"
-        manuscript_name = manuscript_match.group(1) if manuscript_match else "Unknown Manuscript"
-        status = status_match.group(1) if status_match else "Unknown Status"
+            journal_name = journal_match.group(1) if journal_match else "Unknown Journal"
+            manuscript_name = manuscript_match.group(1) if manuscript_match else "Unknown Manuscript"
+            status = status_match.group(1) if status_match else "Unknown Status"
 
-        if "unknown status" in status.lower():
-            return None, None, None
+            if "unknown status" in status.lower():
+                return None, None, None
 
-        return journal_name, manuscript_name, status
+            return journal_name, manuscript_name, status
 
-    except Exception as e:
-        print(f"⚠️ Gemini API Error: {e}")
-        return None, None, None
+        except Exception as e:
+            print(f"⚠️ Gemini API Error: {e}")
+            
+            # Try to rotate to next key if quota exceeded
+            if api_key_manager.handle_api_error(e):
+                retries += 1
+                print(f"🔁 Retry attempt {retries} with new API key")
+                continue
+            else:
+                # For non-quota errors or if we've tried all keys
+                if retries >= max_retries:
+                    print("❌ All API keys have been tried. Cannot proceed.")
+                    return None, None, None
+                retries += 1
+                time.sleep(2)  # Brief pause before retry
+    
+    return None, None, None
 
 def update_journal_status(record_id, new_status, email_id):
     """Update the status field of a matched journal record in the database.
