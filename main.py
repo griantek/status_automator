@@ -99,24 +99,102 @@ class APIKeyManager:
         return False
         
     def handle_api_error(self, error):
-        """Check if error is quota-related and rotate key if needed."""
-        error_str = str(error).lower()
+        """Handle different Gemini API errors with appropriate strategies.
         
-        # Check for different quota/rate limit error messages
+        HTTP Status Codes:
+        - 400: INVALID_ARGUMENT/FAILED_PRECONDITION - Bad request formatting or free tier limitations
+        - 403: PERMISSION_DENIED - API key permissions issue
+        - 404: NOT_FOUND - Resource not found
+        - 429: RESOURCE_EXHAUSTED - Rate limit/quota exceeded
+        - 500: INTERNAL - Server error (might be due to long context)
+        - 503: UNAVAILABLE - Service temporarily overloaded
+        - 504: DEADLINE_EXCEEDED - Request timeout
+        """
+        error_str = str(error).lower()
+        error_code = None
+        
+        # Try to extract HTTP error code if available
+        for code in ["400", "403", "404", "429", "500", "503", "504"]:
+            if code in error_str:
+                error_code = int(code)
+                break
+        
+        # Check for specific error conditions
         quota_exceeded = any(msg in error_str for msg in [
             "quota exceeded", 
             "resource exhausted",
             "rate limit",
             "too many requests",
-            "billing"
+            "429"
         ])
         
-        if quota_exceeded:
-            print(f"⚠️ API quota exceeded for key #{self.current_key_index+1}. Rotating to next key.")
+        timeout_error = any(msg in error_str for msg in [
+            "deadline exceeded",
+            "timeout",
+            "timed out",
+            "504"
+        ])
+        
+        server_error = any(msg in error_str for msg in [
+            "internal",
+            "unavailable",
+            "server error",
+            "500",
+            "503"
+        ])
+        
+        permission_error = any(msg in error_str for msg in [
+            "permission denied",
+            "unauthorized",
+            "403"
+        ])
+        
+        invalid_request = any(msg in error_str for msg in [
+            "invalid argument",
+            "bad request",
+            "400",
+            "failed precondition"
+        ])
+        
+        # Handle based on error type
+        if quota_exceeded or error_code == 429:
+            print(f"⚠️ API quota/rate limit exceeded for key #{self.current_key_index+1}. Rotating to next key.")
             return self.rotate_key()
-        else:
-            print(f"❌ API error not related to quota: {error}")
+            
+        elif timeout_error or error_code == 504:
+            print(f"⚠️ API request timeout for key #{self.current_key_index+1}. Could be due to large input/context.")
+            # Timeout often indicates the request is too complex, try next key
+            return self.rotate_key()
+            
+        elif server_error or error_code in [500, 503]:
+            print(f"⚠️ Gemini API server error. The service might be temporarily overloaded.")
+            # For server errors, let's rotate keys as the next server might respond
+            return self.rotate_key()
+            
+        elif permission_error or error_code == 403:
+            print(f"❌ API key #{self.current_key_index+1} permission denied. Key may be invalid or revoked.")
+            # Definitely rotate for permission errors - key is invalid
+            return self.rotate_key()
+            
+        elif invalid_request or error_code == 400:
+            # For 400 errors, the request format is the issue, not the key
+            if "free tier" in error_str or "billing" in error_str:
+                print(f"❌ Free tier not available in your region for key #{self.current_key_index+1}. Rotating.")
+                return self.rotate_key()
+            else:
+                print(f"❌ Invalid request format: {error}")
+                # Don't rotate for formatting errors as they'll likely happen with any key
+                return False
+                
+        elif error_code == 404:
+            print(f"❌ Resource not found: {error}")
+            # Don't rotate for 404s as they're specific to the request, not the key
             return False
+            
+        else:
+            print(f"❌ Unhandled API error: {error}")
+            # For unknown errors, let's try rotation as a fallback strategy
+            return self.rotate_key()
 
 # Initialize the API key manager
 api_key_manager = APIKeyManager()
@@ -397,6 +475,12 @@ def extract_journal_details(email_body):
     if not is_journal_related(email_body):
         return None, None, None
 
+    # Truncate email body if it's too long to avoid timeout errors
+    max_length = 8000
+    truncated_body = email_body[:max_length] if len(email_body) > max_length else email_body
+    if len(email_body) > max_length:
+        truncated_body += "\n[Email truncated due to length]"
+
     prompt = f"""
     Analyze the following email content and extract the **journal name**, **manuscript title**, and **submission status**. 
     The email MUST be a personalized notification about a manuscript submission process (e.g., 'Your manuscript has been accepted'), 
@@ -405,7 +489,7 @@ def extract_journal_details(email_body):
     If the email isn't about a specific manuscript submission status, return 'Unknown Status'.
 
     Email:
-    {email_body}
+    {truncated_body}
 
     Respond in this exact format:
     Journal: [Journal Name]
@@ -417,12 +501,29 @@ def extract_journal_details(email_body):
     If the email is not about a manuscript submission status, return 'Unknown Status'.
     """
 
-    max_retries = len(api_key_manager.api_keys)
+    max_retries = len(api_key_manager.api_keys) * 2  # Allow multiple tries per key
     retries = 0
     
-    while retries <= max_retries:
+    while retries < max_retries:
         try:
-            model = genai.GenerativeModel("gemini-2.0-flash-lite")
+            # Configure model with safety settings and parameters to avoid issues
+            model = genai.GenerativeModel(
+                model_name="gemini-2.0-flash-lite",
+                generation_config={
+                    "temperature": 0.1,            # Lower temperature for more consistent output
+                    "max_output_tokens": 200,      # Limit output size
+                    "top_p": 0.95,                 # More focused sampling
+                    "top_k": 40                    # More focused token selection
+                },
+                safety_settings=[
+                    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_ONLY_HIGH"},
+                    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_ONLY_HIGH"},
+                    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_ONLY_HIGH"},
+                    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_ONLY_HIGH"}
+                ]
+            )
+            
+            # Set request timeout
             response = model.generate_content(prompt)
             extracted_text = response.text.strip()
 
@@ -442,18 +543,20 @@ def extract_journal_details(email_body):
         except Exception as e:
             print(f"⚠️ Gemini API Error: {e}")
             
-            # Try to rotate to next key if quota exceeded
+            # Try to rotate to next key if applicable error
             if api_key_manager.handle_api_error(e):
                 retries += 1
-                print(f"🔁 Retry attempt {retries} with new API key")
-                continue
+                print(f"🔁 Retry attempt {retries}/{max_retries} with new API key")
             else:
-                # For non-quota errors or if we've tried all keys
-                if retries >= max_retries:
-                    print("❌ All API keys have been tried. Cannot proceed.")
-                    return None, None, None
+                # For errors that don't trigger rotation, implement exponential backoff
+                wait_time = min(30, 2 ** (retries % 5))  # Cap at 30 seconds
+                print(f"⏱️ Error doesn't require key rotation. Waiting {wait_time} seconds before retry...")
+                time.sleep(wait_time)  # Exponential backoff with cap
                 retries += 1
-                time.sleep(2)  # Brief pause before retry
+                
+            if retries >= max_retries:
+                print("❌ Maximum retry attempts reached. Cannot extract journal details.")
+                break
     
     return None, None, None
 
