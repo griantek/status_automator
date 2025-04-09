@@ -12,6 +12,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 from dotenv import load_dotenv
 from fuzzywuzzy import fuzz  # For fuzzy matching
+import requests  # Added for HTTP requests
 
 # Load environment variables
 load_dotenv()
@@ -561,7 +562,7 @@ def extract_journal_details(email_body):
     return None, None, None
 
 def update_journal_status(record_id, new_status, email_id):
-    """Update the status field of a matched journal record in the database.
+    """Update the status field of a matched journal record by calling the status bot service.
     
     Args:
         record_id: The ID of the journal record to update
@@ -572,36 +573,57 @@ def update_journal_status(record_id, new_status, email_id):
         bool: True if update was successful, False otherwise
     """
     try:
-        
         # Validate inputs before update
         if not record_id:
             print(f"❌ Invalid record ID: {record_id}")
             return False
+        
+        external_service_success = False
+        
+        # Get the status bot URL from environment variables
+        status_bot_url = os.getenv("JSTATUSBOT_URL")
+        if status_bot_url:
+            # Make request to the status bot service
+            try:
+                print(f"🔄 Calling status bot service for record ID: {record_id}")
+                response = requests.post(
+                    f"{status_bot_url}/upload-status",
+                    headers={"Content-Type": "application/json"},
+                    json={"journalId": record_id}
+                )
+                
+                # Check if the request was successful
+                if response.ok:
+                    data = response.json()
+                    if data.get("status") == "success":
+                        print(f"✅ Status bot service processed the request successfully")
+                        external_service_success = True
+                    else:
+                        print(f"⚠️ Status bot service returned failure: {data.get('message', 'Unknown error')}")
+                else:
+                    print(f"⚠️ Status bot service returned error: {response.status_code} - {response.text}")
             
+            except Exception as e:
+                print(f"⚠️ Error calling status bot service: {e}")
+                # Continue to database update regardless of external service error
+        else:
+            print("⚠️ JSTATUSBOT_URL environment variable not set, skipping external service call")
+        
+        # Always update the Supabase database, regardless of external service result
         update_data = {
             "status": new_status,
-            "updated_at": datetime.datetime.now().isoformat()  # Using the existing updated_at column
+            "updated_at": datetime.datetime.now().isoformat()
         }
         
-        # More detailed error handling with response inspection
-        try:
-            response = supabase.table("journal_data").update(update_data).eq("id", record_id).execute()
+        print(f"🔄 Updating status in database to '{new_status}' for record ID: {record_id}")
+        update_response = supabase.table("journal_data").update(update_data).eq("id", record_id).execute()
+        
+        if not update_response.data:
+            print(f"⚠️ Supabase update returned no data for record ID: {record_id}")
+            return external_service_success  # Return external service status if database update ambiguous
             
-            if not response.data:
-                print(f"❌ No data returned from update operation for record ID: {record_id}")
-                print(f"⚠️ This usually means the record doesn't exist or you don't have permission")
-                return False
-                
-            if len(response.data) > 0:
-                print(f"✅ Successfully updated journal record ID: {record_id} with status: {new_status}")
-                return True
-            else:
-                print(f"❌ Failed to update journal record ID: {record_id} - No records affected")
-                return False
-                
-        except Exception as api_error:
-            print(f"❌ Supabase API error: {api_error}")
-            return False
+        print(f"✅ Successfully updated journal record ID: {record_id} with status: {new_status}")
+        return True  # Database was updated successfully
             
     except Exception as e:
         print(f"❌ Error updating journal status for record ID {record_id}: {e}")
